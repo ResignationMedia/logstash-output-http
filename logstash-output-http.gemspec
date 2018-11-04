@@ -23,6 +23,7 @@ Gem::Specification.new do |s|
   s.add_runtime_dependency "logstash-mixin-http_client", ">= 6.0.0", "< 7.0.0"
 
   s.add_development_dependency 'logstash-devutils'
+  s.add_development_dependency 'logstash-codec-json'
   s.add_development_dependency 'sinatra'
   s.add_development_dependency 'webrick'
 end

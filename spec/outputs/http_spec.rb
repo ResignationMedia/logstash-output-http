@@ -1,6 +1,7 @@
 require "logstash/devutils/rspec/spec_helper"
 require "logstash/outputs/http"
 require "logstash/codecs/plain"
+require "logstash/codecs/json"
 require "thread"
 require "sinatra"
 require_relative "../supports/compressed_requests"
@@ -269,7 +270,7 @@ describe LogStash::Outputs::Http do
 
     describe "sending with the default (JSON) config" do
       let(:config) {
-        base_config.merge({"url" => url, "http_method" => "post", "pool_max" => 1})
+        base_config.merge({"url" => url, "http_method" => "post", "pool_max" => 1, "codec" => "json"})
       }
       let(:expected_body) { LogStash::Json.dump(event) }
       let(:expected_content_type) { "application/json" }
@@ -279,7 +280,7 @@ describe LogStash::Outputs::Http do
 
     describe "sending the batch as JSON" do
       let(:config) do
-        base_config.merge({"url" => url, "http_method" => "post", "format" => "json_batch"})
+        base_config.merge({"url" => url, "http_method" => "post", "format" => "json_batch", "codec" => "json"})
       end
 
       let(:expected_body) { ::LogStash::Json.dump events }

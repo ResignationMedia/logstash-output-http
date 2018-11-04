@@ -12,6 +12,7 @@ class LogStash::Outputs::Http < LogStash::Outputs::Base
   concurrency :shared
 
   attr_accessor :is_batch
+  attr_accessor :event_count
 
   VALID_METHODS = ["put", "post", "patch", "delete", "get", "head"]
   
@@ -117,11 +118,71 @@ class LogStash::Outputs::Http < LogStash::Outputs::Base
     
     # Run named Timer as daemon thread
     @timer = java.util.Timer.new("HTTP Output #{self.params['id']}", true)
+
+    @codec.on_event do |event, data|
+        successes = java.util.concurrent.atomic.AtomicInteger.new(0)
+        failures  = java.util.concurrent.atomic.AtomicInteger.new(0)
+        retries = java.util.concurrent.atomic.AtomicInteger.new(0)
+
+        pending = Queue.new
+        pending << [event, 0]
+
+        while popped = pending.pop
+          break if popped == :done
+
+            event, attempt = popped
+
+            send_event(event, data, attempt) do |action,event,attempt|
+              begin 
+                action = :failure if action == :retry && !@retry_failed
+                
+                case action
+                when :success
+                  successes.incrementAndGet
+                when :retry
+                  retries.incrementAndGet
+                  
+                  next_attempt = attempt+1
+                  sleep_for = sleep_for_attempt(next_attempt)
+                  @logger.info("Retrying http request, will sleep for #{sleep_for} seconds")
+                  timer_task = RetryTimerTask.new(pending, event, next_attempt)
+                  @timer.schedule(timer_task, sleep_for*1000)
+                when :failure 
+                  failures.incrementAndGet
+                else
+                  raise "Unknown action #{action}"
+                end
+                
+                if action == :success || action == :failure 
+                  if successes.get+failures.get == @event_count
+                    pending << :done
+                  end
+                end
+              rescue => e 
+                # This should never happen unless there's a flat out bug in the code
+                @logger.error("Error sending HTTP Request",
+                  :class => e.class.name,
+                  :message => e.message,
+                  :backtrace => e.backtrace)
+                failures.incrementAndGet
+                raise e
+              end
+            end
+        end
+    end
   end # def register
 
   def multi_receive(events)
     return if events.empty?
-    send_events(events)
+    if @is_batch
+        @event_count = 1
+        @codec.encode(events)
+    else
+        @event_count = events.size
+        events.each do |event|
+            @codec.encode(event)
+        end
+    end
   end
   
   class RetryTimerTask < java.util.TimerTask
@@ -154,78 +215,13 @@ class LogStash::Outputs::Http < LogStash::Outputs::Base
             )
   end
   
-  def send_events(events)
-    successes = java.util.concurrent.atomic.AtomicInteger.new(0)
-    failures  = java.util.concurrent.atomic.AtomicInteger.new(0)
-    retries = java.util.concurrent.atomic.AtomicInteger.new(0)
-    event_count = @is_batch ? 1 : events.size
-
-    pending = Queue.new
-    if @is_batch
-      pending << [events, 0]
-    else
-      events.each {|e| pending << [e, 0]}
-    end
-
-    while popped = pending.pop
-      break if popped == :done
-      
-      event, attempt = popped
-
-      send_event(event, attempt) do |action,event,attempt|
-        begin 
-          action = :failure if action == :retry && !@retry_failed
-          
-          case action
-          when :success
-            successes.incrementAndGet
-          when :retry
-            retries.incrementAndGet
-            
-            next_attempt = attempt+1
-            sleep_for = sleep_for_attempt(next_attempt)
-            @logger.info("Retrying http request, will sleep for #{sleep_for} seconds")
-            timer_task = RetryTimerTask.new(pending, event, next_attempt)
-            @timer.schedule(timer_task, sleep_for*1000)
-          when :failure 
-            failures.incrementAndGet
-          else
-            raise "Unknown action #{action}"
-          end
-          
-          if action == :success || action == :failure 
-            if successes.get+failures.get == event_count
-              pending << :done
-            end
-          end
-        rescue => e 
-          # This should never happen unless there's a flat out bug in the code
-          @logger.error("Error sending HTTP Request",
-            :class => e.class.name,
-            :message => e.message,
-            :backtrace => e.backtrace)
-          failures.incrementAndGet
-          raise e
-        end
-      end
-    end
-  rescue => e
-    @logger.error("Error in http output loop",
-            :class => e.class.name,
-            :message => e.message,
-            :backtrace => e.backtrace)
-    raise e
-  end
-  
   def sleep_for_attempt(attempt)
     sleep_for = attempt**2
     sleep_for = sleep_for <= 60 ? sleep_for : 60
     (sleep_for/2) + (rand(0..sleep_for)/2)
   end
   
-  def send_event(event, attempt)
-    body = event_body(event)
-
+  def send_event(event, data, attempt)
     # Send the request
     url = @is_batch ? @url : event.sprintf(@url)
     headers = @is_batch ? @headers : event_headers(event)
@@ -233,7 +229,9 @@ class LogStash::Outputs::Http < LogStash::Outputs::Base
     # Compress the body and add appropriate header
     if @http_compression == true
       headers["Content-Encoding"] = "gzip"
-      body = gzip(body)
+      body = gzip(data)
+    else
+      body = data
     end
 
     # Create an async request
@@ -321,20 +319,6 @@ class LogStash::Outputs::Http < LogStash::Outputs::Base
     @logger.error("[HTTP Output Failure] #{message}", opts)
   end
 
-  # Format the HTTP body
-  def event_body(event)
-    # TODO: Create an HTTP post data codec, use that here
-    if @format == "json"
-      LogStash::Json.dump(map_event(event))
-    elsif @format == "message"
-      event.sprintf(@message)
-    elsif @format == "json_batch"
-      LogStash::Json.dump(event.map {|e| map_event(e) })
-    else
-      encode(map_event(event))
-    end
-  end
-
   # gzip data
   def gzip(data)
     gz = StringIO.new
@@ -387,7 +371,6 @@ class LogStash::Outputs::Http < LogStash::Outputs::Base
       CGI.escape(key) + "=" + CGI.escape(value.to_s)
     end.join("&")
   end
-
 
   def validate_format!
     if @format == "message"

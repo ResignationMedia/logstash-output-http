@@ -5,3 +5,6 @@ vendor
 *.iml
 .idea
 *~
+
+# rbenv
+.ruby-version
