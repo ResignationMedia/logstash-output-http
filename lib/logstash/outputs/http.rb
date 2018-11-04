@@ -37,6 +37,8 @@ class LogStash::Outputs::Http < LogStash::Outputs::Base
 
   config_name "http"
 
+  default :codec, "json"
+
   # URL to use
   config :url, :validate => :string, :required => :true
 
