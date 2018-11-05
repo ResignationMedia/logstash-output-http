@@ -33,7 +33,7 @@ class LogStash::Outputs::Http < LogStash::Outputs::Base
   # Additionally, note that when parallel execution is used strict ordering of events is not
   # guaranteed!
   #
-  # Beware, this gem does not yet support codecs. Please use the 'format' option for now.
+  # This gem now supports codecs. The format parameter is still around for backwards compatibility. 
 
   config_name "http"
 
@@ -68,7 +68,9 @@ class LogStash::Outputs::Http < LogStash::Outputs::Base
   config :ignorable_codes, :validate => :number, :list => true
 
   # This lets you choose the structure and parts of the event that are sent.
+  # This only works with the json codec or the json and json_batch formats.
   #
+  # Similar functionality should be added to the uri codec plugin in order to make this work for URI encoded data again.
   #
   # For example:
   # [source,ruby]
@@ -78,17 +80,20 @@ class LogStash::Outputs::Http < LogStash::Outputs::Base
 
   # Set the format of the http body.
   #
-  # If form, then the body will be the mapping (or whole event) converted
-  # into a query parameter string, e.g. `foo=bar&baz=fizz...`
+  # Now that we have codec support it is recommended that you use an appropriate codec instead of this parameter.
+  # The one possible exception is the json_batch format.
   #
-  # If message, then the body will be the result of formatting the event according to message
+  # All of the functionality of the form format (converting data to a URI encoded string) has been moved into the uri codec.
   #
-  # Otherwise, the event is sent as json.
+  # Instead of using the message format, use the plain codec and its format parameter.
+  #
+  # Defaults to json (which is also the default for the codec) 
   config :format, :validate => ["json", "json_batch", "form", "message"], :default => "json"
 
   # Set this to true if you want to enable gzip compression for your http requests
   config :http_compression, :validate => :boolean, :default => false
   
+  # This doesn't do anything anymore. Use the format parameter of the plain codec instead.
   config :message, :validate => :string
 
   def register
@@ -122,57 +127,71 @@ class LogStash::Outputs::Http < LogStash::Outputs::Base
     @timer = java.util.Timer.new("HTTP Output #{self.params['id']}", true)
 
     @codec.on_event do |event, data|
-        successes = java.util.concurrent.atomic.AtomicInteger.new(0)
-        failures  = java.util.concurrent.atomic.AtomicInteger.new(0)
-        retries = java.util.concurrent.atomic.AtomicInteger.new(0)
-
-        pending = Queue.new
-        pending << [event, 0]
-
-        while popped = pending.pop
-          break if popped == :done
-
-            event, attempt = popped
-
-            send_event(event, data, attempt) do |action,event,attempt|
-              begin 
-                action = :failure if action == :retry && !@retry_failed
-                
-                case action
-                when :success
-                  successes.incrementAndGet
-                when :retry
-                  retries.incrementAndGet
-                  
-                  next_attempt = attempt+1
-                  sleep_for = sleep_for_attempt(next_attempt)
-                  @logger.info("Retrying http request, will sleep for #{sleep_for} seconds")
-                  timer_task = RetryTimerTask.new(pending, event, next_attempt)
-                  @timer.schedule(timer_task, sleep_for*1000)
-                when :failure 
-                  failures.incrementAndGet
-                else
-                  raise "Unknown action #{action}"
-                end
-                
-                if action == :success || action == :failure 
-                  if successes.get+failures.get == @event_count
-                    pending << :done
-                  end
-                end
-              rescue => e 
-                # This should never happen unless there's a flat out bug in the code
-                @logger.error("Error sending HTTP Request",
-                  :class => e.class.name,
-                  :message => e.message,
-                  :backtrace => e.backtrace)
-                failures.incrementAndGet
-                raise e
-              end
-            end
-        end
+      process_event_data(event, data)
     end
   end # def register
+
+  def process_event_data(event, data)
+    # Override data when using the mapping parameter
+    # Hack around the json codec not having equivalent functionality
+    if @mapping 
+      if @format == "json_batch"
+        data = LogStash::Json.dump(event.map {|e| map_event(e) })
+      elsif @format == "json" or @codec == "json"
+        data = LogStash::Json.dump(map_event(event))
+      end
+    end
+
+    successes = java.util.concurrent.atomic.AtomicInteger.new(0)
+    failures  = java.util.concurrent.atomic.AtomicInteger.new(0)
+    retries = java.util.concurrent.atomic.AtomicInteger.new(0)
+
+    pending = Queue.new
+    pending << [event, 0]
+
+    while popped = pending.pop
+      break if popped == :done
+
+      event, attempt = popped
+
+      send_event(event, data, attempt) do |action,event,attempt|
+        begin 
+          action = :failure if action == :retry && !@retry_failed
+          
+          case action
+          when :success
+            successes.incrementAndGet
+          when :retry
+            retries.incrementAndGet
+            
+            next_attempt = attempt+1
+            sleep_for = sleep_for_attempt(next_attempt)
+            @logger.info("Retrying http request, will sleep for #{sleep_for} seconds")
+            timer_task = RetryTimerTask.new(pending, event, next_attempt)
+            @timer.schedule(timer_task, sleep_for*1000)
+          when :failure 
+            failures.incrementAndGet
+          else
+            raise "Unknown action #{action}"
+          end
+          
+          if action == :success || action == :failure 
+            if successes.get+failures.get == @event_count
+              pending << :done
+            end
+          end
+        rescue => e 
+          # This should never happen unless there's a flat out bug in the code
+          @logger.error("Error sending HTTP Request",
+            :class => e.class.name,
+            :message => e.message,
+            :backtrace => e.backtrace)
+          failures.incrementAndGet
+          raise e
+        end
+      end
+    end
+  end
 
   def multi_receive(events)
     return if events.empty?
@@ -367,26 +386,9 @@ class LogStash::Outputs::Http < LogStash::Outputs::Base
     end
   end
 
-  #TODO Extract this to a codec
-  def encode(hash)
-    return hash.collect do |key, value|
-      CGI.escape(key) + "=" + CGI.escape(value.to_s)
-    end.join("&")
-  end
-
   def validate_format!
-    if @format == "message"
-      if @message.nil?
-        raise "message must be set if message format is used"
-      end
-
-      if @content_type.nil?
-        raise "content_type must be set if message format is used"
-      end
-
-      unless @mapping.nil?
-        @logger.warn "mapping is not supported and will be ignored if message format is used"
-      end
+    unless @format.nil? or @format == "json"
+      @logger.warn "The format parameter is deprecated. Use an appropriate codec instead."
     end
   end
 end

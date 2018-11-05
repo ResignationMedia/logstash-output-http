@@ -2,6 +2,9 @@ require "logstash/devutils/rspec/spec_helper"
 require "logstash/outputs/http"
 require "logstash/codecs/plain"
 require "logstash/codecs/json"
+require "logstash/codecs/uri"
+require "csv"
+require "uri"
 require "thread"
 require "sinatra"
 require_relative "../supports/compressed_requests"
@@ -291,19 +294,40 @@ describe LogStash::Outputs::Http do
 
     end
 
-    describe "sending the event as a form" do
+    describe "sending the event as a csv" do
+      let(:csv_headers) { event.to_hash.keys }
       let(:config) {
-        base_config.merge({"url" => url, "http_method" => "post", "pool_max" => 1, "format" => "form"})
+        base_config.merge({"url" => url, "http_method" => "post", "pool_max" => 1, "content_type" => "text/csv", "codec" => "csv"})
       }
-      let(:expected_body) { subject.send(:encode, event.to_hash) }
+      let(:expected_body) { 
+        CSV.generate(String.new, {:headers => event.to_hash.keys}) do |csv|
+            csv << event.to_hash.values
+        end
+      }
+      let(:expected_content_type) { "text/csv" }
+
+      include_examples("a received event")
+    end
+
+    describe "sending the event as a form" do
+      let(:codec) {
+        LogStash::Plugin.lookup("codec", "uri").new
+      }
+      let(:config) {
+        base_config.merge({"url" => url, "http_method" => "post", "pool_max" => 1, "format" => "form", "codec" => codec})
+      }
+      let(:expected_body) { URI.encode_www_form(event.to_hash) }
       let(:expected_content_type) { "application/x-www-form-urlencoded" }
 
       include_examples("a received event")
     end
 
     describe "sending the event as a message" do
+      let(:codec) {
+        LogStash::Plugin.lookup("codec", "plain").new({"format" => "%{foo} AND %{baz}"})
+      }
       let(:config) {
-        base_config.merge({"url" => url, "http_method" => "post", "pool_max" => 1, "format" => "message", "message" => "%{foo} AND %{baz}"})
+        base_config.merge({"url" => url, "http_method" => "post", "pool_max" => 1, "format" => "message", "message" => "%{foo} AND %{baz}", "codec" => codec})
       }
       let(:expected_body) { "#{event.get("foo")} AND #{event.get("baz")}" }
       let(:expected_content_type) { "text/plain" }
@@ -313,7 +337,7 @@ describe LogStash::Outputs::Http do
 
     describe "sending a mapped event" do
       let(:config) {
-        base_config.merge({"url" => url, "http_method" => "post", "pool_max" => 1, "mapping" => {"blah" => "X %{foo}"} })
+        base_config.merge({"url" => url, "http_method" => "post", "pool_max" => 1, "mapping" => {"blah" => "X %{foo}"}, "codec" => "json" })
       }
       let(:expected_body) { LogStash::Json.dump("blah" => "X #{event.get("foo")}") }
       let(:expected_content_type) { "application/json" }
