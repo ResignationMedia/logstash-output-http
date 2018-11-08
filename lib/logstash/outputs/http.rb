@@ -232,6 +232,7 @@ class LogStash::Outputs::Http < LogStash::Outputs::Base
               "Encountered non-2xx HTTP code #{response.code}",
               :response_code => response.code,
               :url => url,
+              :data => event.to_hash,
               :event => event
             )
   end
